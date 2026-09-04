@@ -1,0 +1,41 @@
+{
+  "event_id": "fictional-2025-01",
+  "session": "race",
+  "available_at": "2025-06-15T17:00:00Z",
+  "finishing_order": [
+    "driver_02",
+    "driver_01",
+    "driver_04",
+    "driver_03"
+  ],
+  "retired_drivers": [
+    "driver_03"
+  ],
+  "events": [
+    {
+      "kind": "mechanical",
+      "driver_id": "driver_03",
+      "description": "Fictional gearbox failure"
+    },
+    {
+      "kind": "safety_car",
+      "driver_id": null,
+      "description": "Fictional mid-race safety car"
+    }
+  ],
+  "actual_weather": {
+    "wet_fraction": 0.6,
+    "air_temperature_c": 26.0,
+    "wind_speed_ms": 5.0
+  },
+  "sources": [
+    {
+      "url": "synthetic://race",
+      "retrieved_at": "2025-06-15T17:00:00Z",
+      "published_at": null,
+      "note": ""
+    }
+  ],
+  "verified": true,
+  "synthetic": true
+}

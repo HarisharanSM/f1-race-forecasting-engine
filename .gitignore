@@ -62,3 +62,9 @@ experiments/artifacts/
 # Temporary files
 tmp/
 temp/
+
+# Generated forecasts, datasets and demonstration runs
+artifacts/
+*.egg-info/
+dist/
+build/
