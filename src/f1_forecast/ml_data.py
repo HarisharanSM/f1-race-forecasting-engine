@@ -7,6 +7,7 @@ import numpy as np
 
 from .engine import FEATURES, features
 from .models import Feedback, Session, Snapshot, validate_order
+from .optional_inputs import effective_driver
 
 FEATURE_NAMES = (
     *FEATURES,
@@ -145,7 +146,7 @@ def feature_matrix(
             snapshot.circuit.tyre_stress,
             snapshot.circuit.disruption_probability,
             (snapshot.circuit.laps or 0) / 100,
-            driver.consistency,
+            effective_driver(driver).consistency,
             teams[driver.team_id].car.reliability,
             len(own) / 10,
             np.mean(own_form) if own_form else 0.5,

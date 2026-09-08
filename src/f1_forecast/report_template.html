@@ -53,6 +53,7 @@ function render(){
  const synthetic=ys.some(s=>s.synthetic);
  $('coverage-note').textContent=(synthetic?'Synthetic pipeline demonstration. ':'Actual archived results. ')+(tested.length?'Each tested weekend was forecast using earlier results only. ':'This year is training history only; there are no held-out predictions to display. ')+'Confidence is an uncalibrated model estimate; historical inputs include reconstruction assumptions.';
  if(ys.some(s=>s.weather_method==='practice_persistence'))$('coverage-note').textContent+=' Weather inputs for these earlier years use available practice observations carried forward, not archived meteorological forecasts.';
+ if(ys.some(s=>s.weather_method==='imputed'))$('coverage-note').textContent+=' Reduced-input sessions use fixed weather assumptions, including training weather, not observed conditions. Check each session notice for missing inputs.';
  if(ys.some(s=>s.format_note))$('coverage-note').textContent+=' Friday qualifying is shared between formats in this year and appears in both model views.';
  const event=ys.filter(s=>s.event_key===state.circuit);const first=event[0];
  $('round').textContent='Round '+String(first.round).padStart(2,'0')+' · '+state.year;
@@ -66,14 +67,31 @@ function render(){
 }
 function renderSession(s){
  const panel=$('session-panel');const forecastCard=card();const header=node('div',undefined,'head-row');header.append(node('h3',sessionLabel(s)),node('span',s.evaluated?'Held-out forecast':'Training history only','badge'+(s.evaluated?'':' neutral')));forecastCard.append(header,node('p','Session: '+date(s.date)+' · Forecast cutoff: '+date(s.cutoff),'sub'));
+ if(s.calibration_role)forecastCard.append(node('p',s.calibration_role+'. '+s.calibration_notice,'notice'));
+ if(s.interruptions){const a=s.interruptions;forecastCard.append(node('h3','Historical interruptions: '+a.status),node('p',a.complete_races+' complete earlier race logs. '+(a.limitations||'Insufficient evidence; existing dynamics retained.'),'notice'));if(a.probabilities)forecastCard.append(table(['Event','Estimated race probability'],Object.entries(a.probabilities).map(([k,v])=>[k,pct(v)])));}
+ if(s.tyre_strategy){const t=s.tyre_strategy;forecastCard.append(node('h3','Tyre strategy: '+t.status),node('p',t.limitations,'notice'));if(t.best_by_stops.length)forecastCard.append(table(['Stops','Tyre sets','Stint laps','Relative time (s)'],t.best_by_stops.map(r=>[String(r.stops),r.sets.join(' / '),r.stint_laps.join(' / '),r.relative_time_s.toFixed(2)])));}
  if(s.weather_method==='practice_persistence')forecastCard.append(node('p','Weather method: practice persistence. Temperature, wind and rain assumptions come from an earlier completed practice session available before this forecast cutoff. They are not a saved weather-provider forecast.','notice'));
+ if(s.weather_method==='imputed')for(const note of s.input_notes||[])forecastCard.append(node('p',note,'notice'));
  if(s.format_note)forecastCard.append(node('p',s.format_note,'notice'));
  if(s.evaluated){
   const tabs=node('nav',undefined,'tabs');tabs.setAttribute('aria-label','Scenario');
   ['Combined outlook',...s.scenarios.map(x=>x.name)].forEach((name,i)=>{let b=node('button',name);b.classList.toggle('active',state.scenario===i-1);b.setAttribute('aria-pressed',String(state.scenario===i-1));b.onclick=()=>{state.scenario=i-1;render();};tabs.append(b);});forecastCard.append(tabs);
   const selected=state.scenario>=0?s.scenarios[state.scenario]:null;
   const intro=node('div',undefined,'scenario');
-  if(selected){intro.append(node('h4',selected.name+' · '+scenarioPct(selected.probability)+' scenario chance'),node('p',selected.brief));const vars=node('div',undefined,'variables');vars.append(node('span','Wet running: '+pct(selected.wet_fraction)+' of session'),node('span','Temperature: '+selected.temperature.toFixed(1)+' °C'),node('span','Wind: '+selected.wind_kmh.toFixed(1)+' km/h'),node('span','Disruption chance: '+pct(selected.disruption_probability)));intro.append(vars,node('p','Disruption means extra uncertainty in the running order. It is a model assumption, not a prediction of a specific crash or safety-car deployment.','small'));}
+  if(selected){
+   intro.append(node('h4',selected.name+' · '+scenarioPct(selected.probability)+' scenario chance'),node('p',selected.brief));
+   const vars=node('div',undefined,'variables');
+   vars.append(node('span','Wet running: '+pct(selected.wet_fraction)+' of session'),node('span','Temperature: '+selected.temperature.toFixed(1)+' °C'),node('span','Wind: '+selected.wind_kmh.toFixed(1)+' km/h'));
+   const events=Object.entries(selected.race_event_rates||{});
+   if(events.length){
+    const names={incident:'Incident',safety_car:'Safety car',virtual_safety_car:'Virtual safety car',red_flag:'Red flag'};
+    for(const [kind,rate] of events)vars.append(node('span',(names[kind]||kind)+': '+pct(rate)+' of simulations'));
+    intro.append(vars,node('p','Optional race events use supplied probabilities and approximate timing, pit opportunities and restart effects. They replace generic disruption noise; event types can overlap.','small'));
+   }else{
+    vars.append(node('span','Disruption chance: '+pct(selected.disruption_probability)));
+    intro.append(vars,node('p','Disruption means extra uncertainty in the running order. It is a model assumption, not a prediction of a specific crash or safety-car deployment.','small'));
+   }
+  }
   else{intro.append(node('h4','All weather scenarios, weighted together'),node('p',s.scenarios.map(x=>x.name+' '+scenarioPct(x.probability)).join(' · ')),node('p','The combined forecast accounts for uncertainty about which scenario occurs.','small'));}
   intro.append(node('p',(s.session==='qualifying'?'Most likely pole sitter: ':'Most likely winner: ')+(selected?selected.winner:s.winner)));intro.append(node('p','The table ranks average finishes; the most likely winner has the highest chance of P1 and can therefore differ from the table’s first driver.','small'));forecastCard.append(intro);
   const rows=selected?selected.rows:s.forecast;
@@ -82,6 +100,15 @@ function renderSession(s){
   forecastCard.append(node('p','Combined-outlook average position error: '+s.metrics.expected_position_mae.toFixed(2)+' · Baseline: '+s.baseline.expected_position_mae.toFixed(2)+' · Lower is better. This score uses the average simulated positions, not the rounded rank difference above.','metrics'));
  }else{forecastCard.append(node('p','This session supplied development history. No out-of-sample forecast was saved, so predicted positions and confidence are intentionally absent.','notice'));}
  panel.append(forecastCard);
+ if(s.joint_effects&&s.joint_effects.length){
+  const joint=card('Driver and car performance: joint estimates');
+  joint.append(node('p','Relative contributions to log lap time, in percentage points. Lower is faster. The +/- values are one estimated standard deviation, not forecast confidence. Driver and car errors are correlated; do not add their uncertainties.','notice'));
+  const effect=e=>e?e.mean_pct.toFixed(3)+' +/- '+e.std_pct.toFixed(3):'Insufficient evidence';
+  const age=e=>e?Math.max(0,Math.floor((new Date(s.cutoff)-new Date(e.observed_at))/86400000))+' days'+(e.current_season_observed?'':' | prior season only'):'No evidence';
+  joint.append(table(['Driver','Team','Driver effect (%)','Car effect (%)','Driver evidence age','Car evidence age','Known car upgrades'],s.joint_effects.map(r=>[r.driver,r.team,effect(r.driver_effect),effect(r.car_effect),age(r.driver_effect),age(r.car_effect),r.car_effect?r.car_effect.upgrade_count:'Unknown'])));
+  joint.append(node('p','Matched tyre, time and weather cohorts inform both effects together. Season transitions and dated upgrades allow car changes. Separation depends on statistical priors; fuel, traffic and setup remain uncertain. Zero upgrades means no supplied applicable record, not proof of no upgrades. These inputs affect forecasts only when a newly trained learned-measurement model selects their correction on earlier validation data.','small'));
+  panel.append(joint);
+ }
  const actualCard=card('Actual '+sessionLabel(s).toLowerCase()+' result');actualCard.append(node('p',(s.session==='qualifying'?'Pole sitter: ':'Winner: ')+s.actual_winner,'sub'));
  actualCard.append(table(['Actual position','Driver','Team','Recorded status','Pace-learning eligibility'],s.actual.map(r=>['P'+r.position,r.driver,r.team,r.status,r.pace_used?'Eligible':'Masked: incident / non-finish'])));
  actualCard.append(node('p','Recorded status is simplified. Non-finish includes the model’s DNS/DSQ approximations; incident details appear below.','small'));panel.append(actualCard);
@@ -89,12 +116,12 @@ function renderSession(s){
 }
 function renderFeedback(s,panel){const f=s.feedback,c=card('Feedback given to ML');
  c.append(node('p','Results became available for later training at '+date(f.available_at)+'. This is the archive’s explicit availability assumption.','sub'));
- const grid=node('div',undefined,'feedback-grid');for(const [title,value,brief] of [['Pace learning',f.clean_drivers+' drivers',f.clean_pairs+' clean driver-pair comparisons; actual order is the target.'],['Retirement learning',s.session==='race'?f.retired.length+' non-finishes':'Not used','The retirement head is trained only on race sessions.'],['Observed weather',(100*s.weather.wet_fraction).toFixed(0)+'% rain samples',s.weather.air_temperature_c.toFixed(1)+' °C · '+(s.weather.wind_speed_ms*3.6).toFixed(1)+' km/h wind']]){const box=node('div',undefined,'feedback-box');box.append(node('h4',title),node('b',value),node('p',brief));grid.append(box);}c.append(grid);
+ const grid=node('div',undefined,'feedback-grid');for(const [title,value,brief] of [['Pace learning',f.clean_drivers+' drivers',f.clean_pairs+' clean driver-pair comparisons; actual order is the target.'],['Retirement learning',s.session==='race'?f.retired.length+' non-finishes':'Not used','The retirement head is trained only on race sessions.'],[s.weather_method==='imputed'?'Imputed weather (not observed)':'Observed weather',(100*s.weather.wet_fraction).toFixed(0)+(s.weather_method==='imputed'?'% assumed wet fraction':'% rain samples'),s.weather.air_temperature_c.toFixed(1)+' °C · '+(s.weather.wind_speed_ms*3.6).toFixed(1)+' km/h wind']]){const box=node('div',undefined,'feedback-box');box.append(node('h4',title),node('b',value),node('p',brief));grid.append(box);}c.append(grid);
  const body=node('div');body.id='feedback-status';body.append(node('p','Used to fit weights in '+f.training_runs.length+' later backtest models; used to select the training epoch in '+f.validation_runs.length+' later validation windows.'));
  if(f.first_training_run)body.append(node('p','First later weight-fitting use: '+f.first_training_run+'.'));
  const finalText=f.final_model_role==='training'?'Used to fit the final saved model.':f.final_model_role==='validation'?'Used for validation of the final saved model; did not directly fit its weights.':'Not used in a saved final model.';body.append(node('p',finalText));c.append(body);
  c.append(node('p','Excluded from pace learning: '+(f.masked.length?f.masked.join(', '):'None recorded')+'.','small'));
- c.append(node('p','Actual weather and events are training feedback after the result becomes available. They were not supplied as facts when forecasting this same session. Future improvement is not guaranteed.','notice'));
+ c.append(node('p',s.weather_method==='imputed'?'Weather is unavailable: the displayed values are fixed imputations used for training and prediction, not measured feedback. Incident lists may be incomplete. Future improvement is not guaranteed.':'Actual weather and events are training feedback after the result becomes available. They were not supplied as facts when forecasting this same session. Future improvement is not guaranteed.','notice'));
  c.append(details('Training and validation audit',list([...f.training_runs.map(x=>'Weight fitting → '+x),...f.validation_runs.map(x=>'Validation → '+x)])));
  const eventList=f.events.length?list(f.events.map(e=>e.kind+' · '+e.driver+' — '+e.description)):node('p','No mapped incident messages recorded.','small');const count=f.events.length;c.append(details('Recorded event messages ('+count+')',eventList));
  const sources=node('ul',undefined,'plain-list');for(const url of s.sources){let item=node('li');try{const u=new URL(url);if(['https:','http:'].includes(u.protocol)){const a=node('a',u.hostname+' · '+u.pathname);a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';item.append(a);}else item.textContent=url;}catch{item.textContent=url;}sources.append(item);}c.append(details('Actual-result and weather sources',sources));panel.append(c);

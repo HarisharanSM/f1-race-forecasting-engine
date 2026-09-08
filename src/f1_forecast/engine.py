@@ -19,6 +19,13 @@ from .models import (
     utcnow,
     validate_order,
 )
+from .optional_inputs import (
+    effective_car,
+    effective_driver,
+    explicit_dynamics,
+    race_event_effects,
+    tyre_rating,
+)
 
 FEATURES = ("pace", "driver", "circuit", "tyres", "grid", "wet", "strategy", "cooling")
 INITIAL = {
@@ -99,8 +106,9 @@ def features(snapshot: Snapshot, wet: float, temperature: float | None = None) -
     heat = max(0, temperature - 25) / 20
     rows = []
     for driver in snapshot.drivers:
+        driver = effective_driver(driver)
         team = teams[driver.team_id]
-        car = team.car
+        car = effective_car(team.car)
         race = snapshot.session == Session.RACE
         grid_score = (0.5 - grid.index(driver.id) / (len(grid) - 1)) if race else 0
         rows.append(
@@ -114,7 +122,7 @@ def features(snapshot: Snapshot, wet: float, temperature: float | None = None) -
                     )
                 )
                 - 0.5,
-                (car.tyre_management - 0.5) * circuit.tyre_stress if race else 0,
+                (tyre_rating(car, driver) - 0.5) * circuit.tyre_stress if race else 0,
                 grid_score * (1 - circuit.overtaking * 0.65),
                 wet * ((driver.wet_skill + car.wet_performance) / 2 - 0.5),
                 ((team.strategy + team.pit_crew) / 2 - 0.5) if race else 0,
@@ -167,6 +175,7 @@ def predict(
     llm_order: list[str] | None = None,
     llm_model: str | None = None,
     ml_model: MLForecaster | None = None,
+    probability_calibrator=None,
 ) -> Forecast:
     state = state or LearnerState()
     if not 100 <= simulations <= 100000:
@@ -197,7 +206,9 @@ def predict(
         if llm_order is not None:
             # Bounded prior: cannot replace the numerical model with arbitrary LLM certainty.
             strength += np.array([0.3 * (0.5 - llm_order.index(d) / (n - 1)) for d in ids])
-        uncertainty = np.array([0.16 + 0.18 * (1 - d.consistency) for d in snapshot.drivers])
+        uncertainty = np.array(
+            [0.16 + 0.18 * (1 - effective_driver(d).consistency) for d in snapshot.drivers]
+        )
         uncertainty += (
             0.20 * scenario.wet_fraction + min(snapshot.weather.wind_speed_ms, 30) * 0.004
         )
@@ -208,7 +219,18 @@ def predict(
             if ml_model
             else rng.normal(size=(simulations, n)) * uncertainty
         )
-        latent += rng.normal(size=(simulations, n)) * disrupted[:, None] * 0.22
+        disruption_noise = rng.normal(size=(simulations, n)) * disrupted[:, None] * 0.22
+        from .interruptions import distribution
+
+        learned_interruptions = distribution(snapshot)[1] is not None
+        if not explicit_dynamics(snapshot.race_dynamics) and not learned_interruptions:
+            latent += disruption_noise
+        # A separate RNG isolates new event draws from existing retirement sampling.
+        latent, event_rates = race_event_effects(
+            latent,
+            snapshot,
+            np.random.default_rng(np.random.SeedSequence([seed, 9173, len(results)])),
+        )
         retired = np.zeros((simulations, n), dtype=bool)
         if snapshot.session == Session.RACE:
             for i, driver in enumerate(snapshot.drivers):
@@ -219,9 +241,24 @@ def predict(
                     counts = state.reliability.get(driver.team_id, [0, 0])
                     mechanical = (20 * (1 - car.reliability) + counts[0]) / (20 + counts[1])
                     incident = (
-                        0.015 + 0.04 * scenario.wet_fraction + 0.02 * (1 - driver.consistency)
+                        0.015
+                        + 0.04 * scenario.wet_fraction
+                        + 0.02 * (1 - effective_driver(driver).consistency)
                     )
                     risk = min(0.85, 1 - (1 - mechanical) * (1 - incident))
+                evidence = driver.performance
+                if (
+                    evidence is not None
+                    and evidence.retirement_probability is not None
+                    and (
+                        not ml_model
+                        or ml_model.metadata.get("config", {}).get("optional_mode", "legacy")
+                        == "legacy"
+                    )
+                ):
+                    risk = (
+                        1 - evidence.weight
+                    ) * risk + evidence.weight * evidence.retirement_probability
                 retired[:, i] = rng.random(simulations) < risk
             # Retirements finish behind finishers, ordered by sampled distance completed.
             latent = np.where(retired, -1000 + rng.random((simulations, n)), latent)
@@ -231,7 +268,11 @@ def predict(
         dnfs = retired.mean(axis=0)
         standings = summarize(ids, matrix, dnfs)
         winner = max(standings, key=lambda row: row.win_probability).driver_id
-        results.append(ScenarioResult(scenario=scenario, winner=winner, standings=standings))
+        results.append(
+            ScenarioResult(
+                scenario=scenario, winner=winner, standings=standings, race_event_rates=event_rates
+            )
+        )
         mixture += scenario.probability * matrix
         mixed_dnfs += scenario.probability * dnfs
     # Remove floating point drift before schema validation.
@@ -240,6 +281,29 @@ def predict(
     warnings = [
         "Research baseline: probabilities are uncalibrated until evaluated on held-out races."
     ]
+    if ml_model and ml_model.metadata.get("config", {}).get("optional_mode") == "learned":
+        warnings.append(
+            "Optional measurements use a regularized correction selected on earlier "
+            "validation weekends. Missing or unsupported evidence has zero correction."
+        )
+    elif any(d.performance is not None for d in snapshot.drivers) or any(
+        t.car.performance is not None for t in snapshot.teams
+    ):
+        warnings.append(
+            "Optional measurements use bounded heuristic mappings, not fitted telemetry models. "
+            "Attach pre-cutoff evidence in sources; missing measurements retain existing ratings."
+        )
+    if ml_model and "validation_selection" in ml_model.metadata:
+        warnings.append(
+            "Pace temperature and optional influence were selected on earlier validation "
+            "forecasts; this does not establish calibrated probabilities on future races."
+        )
+    if explicit_dynamics(snapshot.race_dynamics):
+        warnings.append(
+            "Optional race events replace generic disruption noise with approximate timing, "
+            "score compression, pit opportunities and restarts; this is not a lap simulation. "
+            "Event probabilities are supplied assumptions, not automatically calibrated."
+        )
     if snapshot.data_mode == "historical_reconstruction":
         warnings.append(
             "Historical reconstruction: input availability is assumed and source revisions may differ from event-time data."
@@ -264,14 +328,20 @@ def predict(
         )
     if llm_order is None:
         warnings.append("LLM disabled; numerical scenario model used.")
-    return Forecast(
+    forecast = Forecast(
         id=str(uuid4()),
         event_id=snapshot.event_id,
         session=snapshot.session,
         race_format=snapshot.race_format,
         created_at=utcnow(),
         model_version=state.version,
-        forecast_model="transformer" if ml_model else "heuristic",
+        forecast_model=(
+            "transformer"
+            if ml_model.metadata.get("architecture", "field_transformer") == "field_transformer"
+            else ml_model.metadata["architecture"]
+        )
+        if ml_model
+        else "heuristic",
         ml_model_id=ml_model.model_id if ml_model else None,
         ml_training_cutoff=ml_model.metadata["trained_through"] if ml_model else None,
         simulations_per_scenario=simulations,
@@ -282,6 +352,25 @@ def predict(
         llm_order=llm_order,
         llm_model=llm_model,
         warnings=warnings,
+    )
+    if snapshot.tyre_strategy is not None:
+        from .tyre_strategy import analyze_strategy
+
+        forecast.tyre_strategy_analysis = analyze_strategy(snapshot.tyre_strategy)
+        forecast.warnings.append(
+            "Optional tyre strategy analysis is conditional; finishing probabilities are unchanged."
+        )
+    if snapshot.race_dynamics is not None and snapshot.race_dynamics.history:
+        from .interruptions import estimate
+
+        forecast.interruption_analysis = estimate(snapshot)
+        forecast.warnings.append(
+            "Historical interruption simulation is experimental and not probability-calibrated; see interruption_analysis."
+        )
+    return (
+        probability_calibrator.apply(snapshot, forecast)
+        if probability_calibrator is not None
+        else forecast
     )
 
 
@@ -306,6 +395,17 @@ def evaluate(forecast: Forecast, feedback: Feedback) -> dict:
                     for s in forecast.standings
                 ]
             )
+        ),
+        "position_interval_coverage": float(
+            np.mean(
+                [
+                    s.p10_position <= actual[s.driver_id] <= s.p90_position
+                    for s in forecast.standings
+                ]
+            )
+        ),
+        "position_interval_width": float(
+            np.mean([s.p90_position - s.p10_position for s in forecast.standings])
         ),
     }
 

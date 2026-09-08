@@ -341,7 +341,12 @@ def ratings(rows, previous, cutoff):
 
 
 def collect_history(
-    seasons, output, cache="data/raw/historical", progress=None, race_format="grand_prix"
+    seasons,
+    output,
+    cache="data/raw/historical",
+    progress=None,
+    race_format="grand_prix",
+    include_current_season=False,
 ):
     if race_format not in {"grand_prix", "sprint"}:
         raise ValueError("Unknown race format")
@@ -350,11 +355,16 @@ def collect_history(
         raise ValueError("History output already exists; choose a new file")
     archive = Archive(cache)
     records, exclusions, previous, lineage = [], [], [], []
+    collection_cutoff = utcnow()
     try:
         for year in sorted(set(seasons)):
-            if year < 2024 or year >= utcnow().year:
+            if (
+                year < 2024
+                or year > collection_cutoff.year
+                or (year == collection_cutoff.year and not include_current_season)
+            ):
                 raise ValueError(
-                    "Use completed seasons from 2024 onward for archived forecast coverage"
+                    "Use completed seasons from 2024 onward, or explicitly include the current season"
                 )
             schedule, schedule_sources = season_table(archive, year)
             qualifying = (
@@ -368,11 +378,19 @@ def collect_history(
                     continue
                 key = f"{year}-{round_number:02d}" + ("-sprint" if race_format == "sprint" else "")
                 try:
+                    if round_number not in races and round_number not in qualifying:
+                        raise DataUnavailable(
+                            "No completed classification available at collection time"
+                        )
                     metadata = session_for(event, sessions, race_format)
-                    rrows = classification(
-                        races[round_number][
-                            "Results" if race_format == "grand_prix" else "SprintResults"
-                        ]
+                    rrows = (
+                        classification(
+                            races[round_number][
+                                "Results" if race_format == "grand_prix" else "SprintResults"
+                            ]
+                        )
+                        if round_number in races
+                        else []
                     )
                     if race_format == "sprint":
                         sq, sq_source = archive.get(
@@ -388,6 +406,15 @@ def collect_history(
                         }
                     else:
                         qrows = classification(qualifying[round_number]["QualifyingResults"])
+                    if (
+                        include_current_season
+                        and rrows
+                        and {r["Driver"]["driverId"] for r in qrows}
+                        != {r["Driver"]["driverId"] for r in rrows}
+                    ):
+                        raise DataUnavailable(
+                            "Incomplete qualifying classification: entered race roster differs"
+                        )
                     meeting = metadata["Race"]["meeting_key"]
                     weather_rows, actual_source = archive.get(
                         f"{OPENF1}/weather", {"meeting_key": meeting}
@@ -404,12 +431,21 @@ def collect_history(
                     continue
                 for stage, name, rows, raw_sources in (
                     (Session.QUALIFYING, "Qualifying", qrows, qualifying[round_number]["_sources"]),
-                    (Session.RACE, "Race", rrows, races[round_number]["_sources"]),
+                    (Session.RACE, "Race", rrows, races.get(round_number, {}).get("_sources", [])),
                 ):
-                    raw_source = raw_sources[0]
                     session = metadata[name]
                     start, end = stamp(session["date_start"]), stamp(session["date_end"])
                     cutoff, available = start - timedelta(hours=1), end + timedelta(hours=6)
+                    if not rows or available > collection_cutoff:
+                        exclusions.append(
+                            {
+                                "event_id": key,
+                                "session": stage.value,
+                                "reason": "Session classification unavailable or six-hour publication delay not elapsed",
+                            }
+                        )
+                        continue
+                    raw_source = raw_sources[0]
                     events, retired = result_events(rows, controls, session, stage)
                     try:
                         forecast, fsource, precipitation = forecast_from_archive(
@@ -591,6 +627,8 @@ def collect_history(
         "qualifying_sessions": sum(r["snapshot"]["session"] == "qualifying" for r in records),
         "race_sessions": sum(r["snapshot"]["session"] == "race" for r in records),
         "created_at": utcnow().isoformat(),
+        "collection_cutoff": collection_cutoff.isoformat(),
+        "include_current_season": include_current_season,
         "sha256": hashlib.sha256(content.encode()).hexdigest(),
         "exclusions": exclusions,
         "lineage": lineage,

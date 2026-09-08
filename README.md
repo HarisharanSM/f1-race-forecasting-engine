@@ -24,6 +24,8 @@ This remains a research model. Results and weather are real; some historical inp
 
 ## Read the results
 
+Real-data predictions now default to the installed primary field Transformer. Optional `--model-policy ensemble` uses a Transformer-led, earlier-validation-gated probability mixture; `--model-policy heuristic` explicitly retains the heuristic. See [primary models and usage](docs/PRIMARY_MODELS.md) for training, checkpoint cutoffs and limitations.
+
 Open the generated **`artifacts/real-data/backtest-report.html`** in a browser. Choose a year and circuit, then Grand Prix or sprint qualifying/race. Each weather scenario has a driver table with forecasted position, confidence, actual position, and a position range. A separate actual-results table and ML feedback audit follow. The companion CSV contains every scenario table.
 
 The combined report includes **233 held-out forecasts**: 178 for 2020–2023 and the existing 55 for 2025, with **331 actual session records** across 2019–2025. Training-only sessions are clearly labelled. Shared Friday qualifying in 2021–2022 appears in both separately trained formats. Earlier-year weather inputs use prior practice observations carried forward as estimates. See [earlier-season results and limitations](docs/EARLIER_SEASONS.md) and [report instructions](docs/REPORTING.md).
@@ -60,6 +62,10 @@ ruff format --check src tests
 
 Each driver also gets an 80% marginal position interval (`p10_position`–`p90_position`) and a probability for each finishing position. Scenario probabilities sum to one. Every simulated order contains every entered driver exactly once.
 
+Additional inputs are optional: teammate timing gaps, clean-lap variability, car braking/aero/handling/power/cornering ratings, measured tyre degradation, total retirement risk, and safety-car/VSC/red-flag probabilities. See [optional inputs and their limits](docs/OPTIONAL_INPUTS.md) and the runnable `examples/race-optional.json`. Missing values preserve existing behavior. These additions use bounded heuristic adapters; they do not automatically collect telemetry or establish an accuracy improvement.
+
+For measured inputs, the new [learned measurement mode](docs/LEARNED_MEASUREMENTS.md) keeps base ratings separate, records sample quality and missingness, learns regularized corrections on earlier weekends, and can select probability temperature on validation forecasts. Use `--optional-mode learned --calibrate` when training or backtesting this experimental model. Existing checkpoints retain their saved behavior.
+
 See `examples/qualifying.json`, `examples/race.json`, and the contracts in `src/f1_forecast/models.py`. The example files use four fictional drivers for readability; the demo uses 22. All ratings are **[0, 1], higher means better**. Low cooling, tyre-management, or cornering ratings represent weaknesses. Free-text capabilities, weaknesses and notes inform the LLM when enabled; the numerical model uses ratings.
 
 ## Predict and apply feedback
@@ -81,6 +87,15 @@ f1-forecast --database artifacts/example.sqlite3 feedback RACE_FORECAST_ID examp
 Supply `starting_grid` to account for penalties: an ordered list of every entered driver, with pit-lane starters after grid starters. Without it, actual qualifying order is used and the forecast reports that assumption. A withdrawal requires an updated roster and matching classification; incomplete or mismatched fields are rejected.
 
 ## Live data collection
+
+For practice, lap, tyre and stint observations, use the new [expanded collection pipeline](docs/COLLECTION.md):
+
+```sh
+f1-forecast fetch-performance --seasons 2024 2025 --rounds 1 2 \
+  --provider fastf1 --output data/processed/performance-expanded
+```
+
+Requires the `collection` extra (included by `uv sync --all-extras`). It produces a ready-to-open `quality-report.html`, driver CSV, cached session records and an auditable manifest. Collection is bounded to 20 new sessions per run by default and supports `--resume`. `enrich-performance` fills optional forecast measurements only from eligible earlier evidence, preserving original datasets and labels. See the guide for the recorded 10,147-lap initial batch and its limitations.
 
 Collectors use [Jolpica](https://github.com/jolpica/jolpica-f1/blob/main/docs/README.md) for schedules/classifications, [OpenF1](https://openf1.org/docs/) for observed weather and race control, and [Open-Meteo](https://open-meteo.com/en/docs) for forecast weather. Raw responses and retrieval times are archived under `data/raw/`. Requests have timeouts and bounded retries. Provider terms, access restrictions and publication delays apply.
 

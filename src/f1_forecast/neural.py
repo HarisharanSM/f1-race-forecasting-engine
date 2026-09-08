@@ -44,6 +44,8 @@ class TrainingConfig:
     min_train_events: int = 3
     validation_events: int = 1
     seed: int = 42
+    optional_mode: str = "legacy"
+    calibrate: bool = False
 
     def __post_init__(self):
         if not 1 <= self.epochs <= 2000 or not 1 <= self.patience <= 2000:
@@ -56,6 +58,8 @@ class TrainingConfig:
             raise ValueError("Invalid dropout, learning rate or seed")
         if self.min_train_events < 1 or self.validation_events < 1:
             raise ValueError("Require separate training and validation events")
+        if self.optional_mode not in {"legacy", "ignore", "learned"}:
+            raise ValueError("optional_mode must be legacy, ignore or learned")
 
 
 class FieldTransformer(nn.Module):
@@ -90,7 +94,35 @@ class FieldTransformer(nn.Module):
         return pace, values[:, :, 2]
 
 
-def pack(records: list[Record], history: list[dict]):
+class IndependentRanker(nn.Module):
+    """Linear pairwise ranker or small per-driver MLP, with the same session/DNF heads."""
+
+    def __init__(self, config, nonlinear=False):
+        super().__init__()
+        self.output = (
+            nn.Sequential(
+                nn.Linear(len(FEATURE_NAMES), config.hidden_size),
+                nn.GELU(),
+                nn.Linear(config.hidden_size, 3),
+            )
+            if nonlinear
+            else nn.Linear(len(FEATURE_NAMES), 3)
+        )
+
+    def forward(self, x, padding):
+        values = self.output(x)
+        return torch.where(x[:, :, 8] > 0.5, values[:, :, 1], values[:, :, 0]), values[:, :, 2]
+
+
+def make_network(config, kind):
+    if kind == "field_transformer":
+        return FieldTransformer(config)
+    if kind in {"linear_ranker", "mlp_ranker"}:
+        return IndependentRanker(config, nonlinear=kind == "mlp_ranker")
+    raise ValueError("Unsupported ranking architecture")
+
+
+def pack(records: list[Record], history: list[dict], optional_mode="legacy"):
     """Actual weather is a training-only condition; forecast inference uses scenarios."""
     size = max(len(r.snapshot.drivers) for r in records)
     x = torch.zeros((len(records), size, len(FEATURE_NAMES)), dtype=torch.float32)
@@ -100,6 +132,10 @@ def pack(records: list[Record], history: list[dict]):
     retired = torch.zeros_like(ranks)
     for index, record in enumerate(records):
         s, a = record.snapshot, record.feedback
+        if optional_mode != "legacy":
+            from .measurement_features import without_performance
+
+            s = without_performance(s)
         n = len(s.drivers)
         x[index, :n] = torch.from_numpy(
             feature_matrix(
@@ -163,13 +199,29 @@ class NeuralForecaster:
 
     def scenario_parameters(self, snapshot: Snapshot, scenario: Scenario):
         self.check_snapshot(snapshot)
-        matrix = feature_matrix(snapshot, self.history, scenario.wet_fraction)
+        mode = self.metadata["config"].get("optional_mode", "legacy")
+        base_snapshot = snapshot
+        if mode != "legacy":
+            from .measurement_features import without_performance
+
+            base_snapshot = without_performance(snapshot)
+        matrix = feature_matrix(base_snapshot, self.history, scenario.wet_fraction)
         with torch.inference_mode():
             pace, logits = self.network(
                 torch.from_numpy(matrix).unsqueeze(0),
                 torch.zeros((1, len(matrix)), dtype=torch.bool),
             )
         pace = pace[0].numpy().astype(float)
+        adjustment = self.metadata.get("measurement_adjustment")
+        if adjustment:
+            from .measurement_features import measurement_matrix
+
+            weights = adjustment["weights"][snapshot.session.value]
+            delta = measurement_matrix(
+                snapshot, scenario.wet_fraction, adjustment["feature_names"]
+            ) @ np.asarray(weights)
+            pace += np.clip(delta, -0.5, 0.5)
+        pace /= self.metadata.get("pace_temperature", 1.0)
         risks = torch.sigmoid(logits[0]).numpy().astype(float)
         if snapshot.session == Session.QUALIFYING:
             risks = np.zeros(len(matrix))
@@ -202,8 +254,27 @@ class NeuralForecaster:
             if hashlib.sha256((directory / filename).read_bytes()).hexdigest() != metadata[key]:
                 raise ValueError("ML checkpoint checksum mismatch")
         config = TrainingConfig(**metadata["config"])
+        adjustment = metadata.get("measurement_adjustment")
+        if adjustment:
+            from .measurement_features import LEGACY_MEASUREMENT_NAMES, MEASUREMENT_NAMES
+
+            if adjustment.get("feature_names") not in (
+                list(LEGACY_MEASUREMENT_NAMES),
+                list(MEASUREMENT_NAMES),
+            ):
+                raise ValueError("Unsupported optional measurement schema")
+            for stage in ("race", "qualifying"):
+                weights = np.asarray(adjustment.get("weights", {}).get(stage, []))
+                if (
+                    weights.shape != (len(adjustment["feature_names"]),)
+                    or not np.isfinite(weights).all()
+                ):
+                    raise ValueError("Invalid optional measurement coefficients")
+        temperature = metadata.get("pace_temperature", 1.0)
+        if not np.isfinite(temperature) or not 0.5 <= temperature <= 2:
+            raise ValueError("Invalid pace calibration temperature")
         with torch.random.fork_rng(devices=[]):
-            network = FieldTransformer(config)
+            network = make_network(config, metadata["architecture"])
         network.load_state_dict(
             torch.load(directory / "weights.pt", map_location="cpu", weights_only=True)
         )
@@ -211,7 +282,9 @@ class NeuralForecaster:
         return cls(network, metadata, history)
 
 
-def fit_records(records: list[Record], config: TrainingConfig) -> NeuralForecaster:
+def fit_records(
+    records: list[Record], config: TrainingConfig, *, network_kind="field_transformer"
+) -> NeuralForecaster:
     train, validation = chronological_split(
         records, config.min_train_events, config.validation_events
     )
@@ -220,12 +293,12 @@ def fit_records(records: list[Record], config: TrainingConfig) -> NeuralForecast
         len(set(r.feedback.finishing_order) - excluded_drivers(r.feedback)) >= 2 for r in train
     ):
         raise ValueError("Training needs incident-free driver pairs for the pace objective")
-    train_batch = pack(train, train_history)
-    validation_batch = pack(validation, train_history)
+    train_batch = pack(train, train_history, config.optional_mode)
+    validation_batch = pack(validation, train_history, config.optional_mode)
     # This local RNG context makes retraining reproducible without changing the caller's seed.
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(config.seed)
-        network = FieldTransformer(config)
+        network = make_network(config, network_kind)
         optimizer = torch.optim.AdamW(
             network.parameters(), lr=config.learning_rate, weight_decay=0.01
         )
@@ -273,7 +346,7 @@ def fit_records(records: list[Record], config: TrainingConfig) -> NeuralForecast
     development = train + validation
     metadata = {
         "format_version": 1,
-        "architecture": "field_transformer",
+        "architecture": network_kind,
         "model_id": str(uuid4()),
         "feature_names": list(FEATURE_NAMES),
         "config": asdict(config),
@@ -309,7 +382,12 @@ def fit_records(records: list[Record], config: TrainingConfig) -> NeuralForecast
         "learning_curve": curve,
         "probabilities_calibrated": False,
     }
-    return NeuralForecaster(network, metadata, [history_summary(r) for r in development])
+    model = NeuralForecaster(network, metadata, [history_summary(r) for r in development])
+    if config.optional_mode == "learned" or config.calibrate:
+        from .measurement_learning import fit_adjustment
+
+        fit_adjustment(model, train, validation, config)
+    return model
 
 
 def train_model(

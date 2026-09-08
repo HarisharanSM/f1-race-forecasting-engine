@@ -1,0 +1,57 @@
+{
+  "event_id": "fictional-optional-2025-01",
+  "season": 2025,
+  "round": 1,
+  "session": "race",
+  "session_start": "2025-06-15T14:00:00Z",
+  "as_of": "2025-06-15T11:00:00Z",
+  "drivers": [
+    {"id": "a1", "name": "Driver A1", "team_id": "a", "performance": {
+      "available_at": "2025-06-15T10:00:00Z",
+      "qualifying_teammate_delta_pct": -0.15,
+      "race_teammate_delta_pct": -0.1,
+      "clean_lap_variability_pct": 0.3,
+      "tyre_management": 0.7,
+      "retirement_probability": 0.05
+    }},
+    {"id": "a2", "name": "Driver A2", "team_id": "a"},
+    {"id": "b1", "name": "Driver B1", "team_id": "b"},
+    {"id": "b2", "name": "Driver B2", "team_id": "b"}
+  ],
+  "teams": [
+    {"id": "a", "name": "Team A", "car": {"performance": {
+      "available_at": "2025-06-15T10:00:00Z",
+      "qualifying_gap_pct": 0.4,
+      "race_gap_pct": 0.6,
+      "braking": 0.75,
+      "aerodynamics": 0.8,
+      "handling": 0.7,
+      "power_delivery": 0.65,
+      "medium_speed_cornering": 0.8,
+      "downforce": 0.8,
+      "aerodynamic_efficiency": 0.7,
+      "tyre_degradation_s_per_lap": 0.08
+    }}},
+    {"id": "b", "name": "Team B", "car": {}}
+  ],
+  "circuit": {"id": "test", "name": "Fictional Test Circuit", "latitude": 1.29,
+              "longitude": 103.86, "laps": 58},
+  "weather": {"rain_probability": 0.3, "air_temperature_c": 29, "wind_speed_ms": 4,
+              "issued_at": "2025-06-15T10:00:00Z", "valid_at": "2025-06-15T14:00:00Z",
+              "source": "synthetic://weather"},
+  "qualifying_order": ["a1", "b1", "a2", "b2"],
+  "race_dynamics": {
+    "available_at": "2025-06-15T10:00:00Z",
+    "safety_car_probability": 0.35,
+    "virtual_safety_car_probability": 0.2,
+    "red_flag_probability": 0.05,
+    "event_lap_fraction": 0.6,
+    "neutralized_fraction": 0.1,
+    "pit_opportunity_probability": 0.5,
+    "restart_variability": 0.25
+  },
+  "sources": [{"url": "synthetic://optional-demo", "retrieved_at": "2025-06-15T10:00:00Z",
+               "note": "All measurements and event probabilities are invented test data."}],
+  "notes": ["Synthetic example demonstrating optional inputs, not measured F1 performance."],
+  "synthetic": true
+}

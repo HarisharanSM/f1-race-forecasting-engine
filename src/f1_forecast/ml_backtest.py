@@ -29,6 +29,7 @@ def backtest_transformer(
     seed: int = 42,
     save_model: str | Path | None = None,
     test_from_season: int | None = None,
+    prediction_rows: list[dict] | None = None,
     progress=None,
 ) -> dict:
     config = config or TrainingConfig()
@@ -37,6 +38,29 @@ def backtest_transformer(
     if save_model and Path(save_model).exists() and any(Path(save_model).iterdir()):
         raise ValueError("Model directory is not empty; choose a new checkpoint directory")
     records = records_from_json(rows)
+    prediction_records = (
+        records_from_json(prediction_rows) if prediction_rows is not None else records
+    )
+    prediction_map = {(r.snapshot.event_id, r.snapshot.session): r for r in prediction_records}
+    if prediction_rows is not None:
+        from .measurement_features import without_performance
+
+        if len(records) != len(prediction_records):
+            raise ValueError("Ablation must retain the same sessions")
+        for record in records:
+            other = prediction_map.get((record.snapshot.event_id, record.snapshot.session))
+            if other is None or record.feedback != other.feedback:
+                raise ValueError("Ablation must retain identical outcome labels")
+            snapshots = [
+                without_performance(r.snapshot).model_dump(mode="json") for r in (record, other)
+            ]
+            for snapshot in snapshots:
+                snapshot.pop("sources")
+                snapshot.pop("notes")
+            if snapshots[0] != snapshots[1]:
+                raise ValueError(
+                    "Ablation may only change optional measurements and their provenance"
+                )
     if any(r.feedback.available_at > utcnow() for r in records):
         raise ValueError("Backtest requires already available historical results")
     groups = event_groups(records)
@@ -78,7 +102,11 @@ def backtest_transformer(
             "best_epoch": model.metadata["best_epoch"],
             "best_validation_loss": model.metadata["best_validation_loss"],
         }
+        if "validation_selection" in model.metadata:
+            fold["validation_selection"] = model.metadata["validation_selection"]
+            fold["pace_temperature"] = model.metadata.get("pace_temperature", 1.0)
         for record in target:
+            record = prediction_map[record.snapshot.event_id, record.snapshot.session]
             neural = predict(record.snapshot, simulations=simulations, seed=seed, ml_model=model)
             baseline = predict(record.snapshot, simulations=simulations, seed=seed)
             scored.append(
@@ -109,7 +137,14 @@ def backtest_transformer(
         "sessions_evaluated": len(scored),
         "data_modes": sorted({r.snapshot.data_mode for r in records}),
         "test_from_season": test_from_season,
-        "dataset_sha256": hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest(),
+        "dataset_sha256": hashlib.sha256(
+            json.dumps(
+                prediction_rows if prediction_rows is not None else rows, sort_keys=True
+            ).encode()
+        ).hexdigest(),
+        "training_dataset_sha256": hashlib.sha256(
+            json.dumps(rows, sort_keys=True).encode()
+        ).hexdigest(),
         "folds": folds,
         "warmup_events": skipped,
         "results": scored,

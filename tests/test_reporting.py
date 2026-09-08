@@ -67,6 +67,25 @@ def test_report_rejects_wrong_source_dataset(bundle, tmp_path):
         render_backtest_report([changed], tmp_path / "bad.html")
 
 
+def test_optional_race_event_frequencies_are_available_in_report(bundle, tmp_path):
+    changed = deepcopy(bundle)
+    result = next(r for r in changed["report"]["results"] if r["session"] == "race")
+    result["forecast"]["scenarios"][0]["race_event_rates"] = {
+        "safety_car": 0.3,
+        "virtual_safety_car": 0.2,
+        "red_flag": 0.05,
+    }
+    path = tmp_path / "events.html"
+    render_backtest_report([changed], path)
+    session = next(
+        s
+        for s in payload(path)["sessions"]
+        if s["event_id"] == result["event_id"] and s["session"] == "race"
+    )
+    assert session["scenarios"][0]["race_event_rates"]["safety_car"] == 0.3
+    assert "Optional race events use supplied probabilities" in path.read_text()
+
+
 def test_feedback_usage_does_not_claim_validation_fits_weights(bundle):
     records = records_from_json(bundle["records"])
     last = feedback_usage(records[-1], bundle["report"], records)

@@ -32,6 +32,133 @@ class Source(Model):
     availability_basis: str = ""
 
 
+class MeasurementQuality(Model):
+    samples: int = Field(ge=1)
+    cohorts: int = Field(default=1, ge=1)
+    spread_pct: float | None = Field(default=None, ge=0, le=100)
+    usable_fraction: Unit
+    observed_at: AwareDatetime
+    source_session: Literal["FP1", "FP2", "FP3", "Q", "SQ", "S", "R"]
+    source_event: str
+
+
+class JointEffectEstimate(Model):
+    mean_pct: float = Field(ge=-20, le=20)
+    std_pct: float = Field(ge=0, le=100)
+    available_at: AwareDatetime
+    observed_at: AwareDatetime
+    season: int = Field(ge=1950, le=2200)
+    samples: int = Field(ge=1)
+    sessions: int = Field(ge=1)
+    current_season_observed: bool
+    prior_dependent: bool = True
+    upgrade_count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def coherent(self):
+        if self.observed_at > self.available_at:
+            raise ValueError("Joint evidence cannot be available before it was observed")
+        return self
+
+
+class CarUpgrade(Model):
+    id: Identifier
+    introduced_at: AwareDatetime
+    available_at: AwareDatetime
+    source_url: str = Field(min_length=1)
+    description: str = ""
+
+
+class TeamUpgrade(CarUpgrade):
+    team_id: Identifier
+
+
+class PerformanceEvidence(Model):
+    available_at: AwareDatetime | None = None
+    weight: Unit = 0.5
+    quality: dict[str, MeasurementQuality] = Field(default_factory=dict)
+    joint_effects: dict[Literal["qualifying", "race"], JointEffectEstimate] = Field(
+        default_factory=dict
+    )
+
+
+class CarPerformance(PerformanceEvidence):
+    qualifying_gap_pct: float | None = Field(default=None, ge=-20, le=20)
+    race_gap_pct: float | None = Field(default=None, ge=-20, le=20)
+    braking: Unit | None = None
+    aerodynamics: Unit | None = None
+    handling: Unit | None = None
+    power_delivery: Unit | None = None
+    medium_speed_cornering: Unit | None = None
+    downforce: Unit | None = None
+    aerodynamic_efficiency: Unit | None = None
+    tyre_degradation_s_per_lap: float | None = Field(default=None, ge=0, le=2)
+
+
+class DriverPerformance(PerformanceEvidence):
+    qualifying_teammate_delta_pct: float | None = Field(default=None, ge=-20, le=20)
+    race_teammate_delta_pct: float | None = Field(default=None, ge=-20, le=20)
+    clean_lap_variability_pct: float | None = Field(default=None, ge=0, le=20)
+    tyre_management: Unit | None = None
+    # Total per-race DNF probability replaces, rather than adds to, existing DNF risk.
+    retirement_probability: Unit | None = None
+
+
+class InterruptionEpisode(Model):
+    kind: Literal["incident", "safety_car", "virtual_safety_car", "red_flag"]
+    start_fraction: Unit
+    duration_fraction: Unit = 0
+    affected_drivers: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_episode(self):
+        if self.start_fraction + self.duration_fraction > 1:
+            raise ValueError("Interruption extends beyond race distance")
+        if len(set(self.affected_drivers)) != len(self.affected_drivers):
+            raise ValueError("Duplicate affected drivers")
+        return self
+
+
+class InterruptionObservation(Model):
+    event_id: str
+    season: int
+    round: int
+    circuit_id: str
+    race_format: Literal["grand_prix", "sprint"]
+    observed_at: AwareDatetime
+    available_at: AwareDatetime
+    source: str = Field(min_length=1)
+    complete: bool
+    entrants: list[str] = Field(min_length=2)
+    episodes: list[InterruptionEpisode] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_observation(self):
+        if self.observed_at > self.available_at:
+            raise ValueError("Observation availability precedes observation")
+        if len(set(self.entrants)) != len(self.entrants):
+            raise ValueError("Duplicate incident-history entrants")
+        if any(not set(e.affected_drivers) <= set(self.entrants) for e in self.episodes):
+            raise ValueError("Unknown affected driver")
+        return self
+
+
+class RaceDynamics(Model):
+    available_at: AwareDatetime | None = None
+    safety_car_probability: Unit = 0
+    virtual_safety_car_probability: Unit = 0
+    red_flag_probability: Unit = 0
+    event_lap_fraction: Unit | None = None
+    neutralized_fraction: Unit = 0.1
+    pit_opportunity_probability: Unit = 0.5
+    restart_variability: Unit = 0.25
+    history: list[InterruptionObservation] = Field(default_factory=list, max_length=1000)
+    seconds_per_score: float = Field(default=20, gt=0, le=300)
+    incident_delay_s: float = Field(default=10, ge=0, le=300)
+    green_pit_loss_s: float = Field(default=22, ge=0, le=120)
+    neutralized_pit_loss_s: float = Field(default=12, ge=0, le=120)
+
+
 class Car(Model):
     name: str = "Unspecified"
     qualifying_pace: Unit = 0.5
@@ -43,6 +170,8 @@ class Car(Model):
     wet_performance: Unit = 0.5
     cooling: Unit = 0.5
     reliability: Unit = 0.95
+    performance: CarPerformance | None = None
+    upgrades: list[CarUpgrade] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     weaknesses: list[str] = Field(default_factory=list)
 
@@ -64,6 +193,7 @@ class Driver(Model):
     race_skill: Unit = 0.5
     wet_skill: Unit = 0.5
     consistency: Unit = 0.5
+    performance: DriverPerformance | None = None
 
 
 class Circuit(Model):
@@ -95,6 +225,53 @@ class Weather(Model):
     source: str
 
 
+class TyreLap(Model):
+    stint_id: str
+    lap: int = Field(ge=1)
+    age: int = Field(ge=0, le=150)
+    duration_s: float = Field(gt=0, le=600)
+    fuel_correction_s: float = Field(ge=0, le=30)
+    observed_at: AwareDatetime
+    available_at: AwareDatetime
+    circuit_id: str
+    car_spec: str
+    compound: Literal["SOFT", "MEDIUM", "HARD"]
+    track_temperature_c: float = Field(ge=0, le=80)
+    clean: bool
+    dry: bool
+
+
+class TyreSet(Model):
+    id: str
+    compound: Literal["SOFT", "MEDIUM", "HARD"]
+    initial_age: int = Field(default=0, ge=0, le=150)
+    fresh_pace_offset_s: float = Field(ge=-10, le=10)
+
+
+class TyreStrategyInput(Model):
+    available_at: AwareDatetime
+    source: str = Field(min_length=1)
+    circuit_id: str
+    car_spec: str
+    track_temperature_c: float = Field(ge=0, le=80)
+    race_laps: int = Field(ge=5, le=100)
+    green_pit_loss_s: float = Field(gt=0, le=120)
+    neutralized_pit_loss_s: float | None = Field(default=None, gt=0, le=120)
+    require_two_compounds: bool = True
+    sets: list[TyreSet] = Field(min_length=1, max_length=6)
+    laps: list[TyreLap] = Field(default_factory=list, max_length=20000)
+
+    @model_validator(mode="after")
+    def unique_evidence(self):
+        if len({s.id for s in self.sets}) != len(self.sets):
+            raise ValueError("Tyre set IDs must be unique")
+        if len({(r.stint_id, r.lap) for r in self.laps}) != len(self.laps):
+            raise ValueError("Duplicate stint laps")
+        if any(r.observed_at > r.available_at for r in self.laps):
+            raise ValueError("Tyre lap availability precedes observation")
+        return self
+
+
 class Snapshot(Model):
     event_id: Identifier
     season: int = Field(ge=1950, le=2200)
@@ -109,6 +286,8 @@ class Snapshot(Model):
     weather: Weather
     qualifying_order: list[str] | None = None
     starting_grid: list[str] | None = None
+    race_dynamics: RaceDynamics | None = None
+    tyre_strategy: TyreStrategyInput | None = None
     sources: list[Source] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     synthetic: bool = False
@@ -116,6 +295,25 @@ class Snapshot(Model):
 
     @model_validator(mode="after")
     def coherent(self):
+        if self.race_dynamics is not None:
+            history = self.race_dynamics.history
+            if len({(h.season, h.round, h.race_format) for h in history}) != len(history):
+                raise ValueError("Duplicate interruption history weekends")
+            if any(
+                h.available_at >= self.as_of or (h.season, h.round) == (self.season, self.round)
+                for h in history
+            ):
+                raise ValueError("Interruption history includes target weekend or future evidence")
+        if self.tyre_strategy is not None:
+            t = self.tyre_strategy
+            if self.session != Session.RACE:
+                raise ValueError("Tyre strategy requires a race snapshot")
+            if t.circuit_id != self.circuit.id:
+                raise ValueError("Tyre strategy circuit differs from snapshot")
+            if self.circuit.laps is not None and t.race_laps != self.circuit.laps:
+                raise ValueError("Tyre strategy race length differs from snapshot")
+            if t.available_at > self.as_of or any(r.available_at > self.as_of for r in t.laps):
+                raise ValueError("Tyre strategy evidence is newer than prediction cutoff")
         drivers = [d.id for d in self.drivers]
         teams = [t.id for t in self.teams]
         if len(drivers) != len(set(drivers)) or len(teams) != len(set(teams)):
@@ -130,6 +328,35 @@ class Snapshot(Model):
             raise ValueError("Weather must be valid within three hours of the session")
         for source in self.sources:
             check_source_time(source, self.as_of, self.data_mode)
+        evidence = [d.performance for d in self.drivers]
+        evidence.extend(t.car.performance for t in self.teams)
+        evidence.append(self.race_dynamics)
+        if any(e and e.available_at and e.available_at > self.as_of for e in evidence):
+            raise ValueError("Optional input evidence is newer than the prediction cutoff")
+        for e in evidence:
+            if isinstance(e, PerformanceEvidence) and any(
+                j.season != self.season for j in e.joint_effects.values()
+            ):
+                raise ValueError("Joint effect must target the snapshot season")
+            if isinstance(e, PerformanceEvidence) and any(
+                j.available_at > self.as_of or j.observed_at > self.as_of
+                for j in e.joint_effects.values()
+            ):
+                raise ValueError("Joint performance evidence is newer than prediction cutoff")
+        for team in self.teams:
+            if len({u.id for u in team.car.upgrades}) != len(team.car.upgrades):
+                raise ValueError("Car upgrade IDs must be unique within a team")
+            if any(u.available_at > self.as_of for u in team.car.upgrades):
+                raise ValueError("Car upgrade information is newer than prediction cutoff")
+        if any(
+            q.observed_at > self.as_of
+            for e in evidence
+            if isinstance(e, PerformanceEvidence)
+            for q in e.quality.values()
+        ):
+            raise ValueError("Optional measurement quality is newer than the prediction cutoff")
+        if self.session == Session.QUALIFYING and self.race_dynamics is not None:
+            raise ValueError("race_dynamics is only supported for race predictions")
         if self.session == Session.RACE and self.qualifying_order is None:
             raise ValueError("Race prediction requires actual qualifying_order")
         if self.session == Session.QUALIFYING and (
@@ -187,9 +414,12 @@ class ScenarioResult(Model):
     scenario: Scenario
     winner: str
     standings: list[Standing]
+    race_event_rates: dict[str, Unit] = Field(default_factory=dict)
 
 
 class Forecast(Model):
+    interruption_analysis: dict | None = None
+    tyre_strategy_analysis: dict | None = None
     id: str
     event_id: str
     session: Session

@@ -88,6 +88,7 @@ def render_backtest_report(bundles, output):
                             "brief": scenario_brief(s.wet_fraction),
                             "wet_fraction": s.wet_fraction,
                             "disruption_probability": s.disruption_probability,
+                            "race_event_rates": scenario.race_event_rates,
                             "temperature": snapshot.weather.air_temperature_c,
                             "wind_kmh": snapshot.weather.wind_speed_ms * 3.6,
                             "winner": names[scenario.winner],
@@ -111,7 +112,10 @@ def render_backtest_report(bundles, output):
                     "year": snapshot.season,
                     "round": snapshot.round,
                     "event_key": f"{snapshot.season}-{snapshot.round:02d}",
-                    "weather_method": "practice_persistence"
+                    "input_notes": snapshot.notes,
+                    "weather_method": "imputed"
+                    if any(note.startswith("REDUCED INPUT:") for note in snapshot.notes)
+                    else "practice_persistence"
                     if any(
                         "WEATHER METHOD: practice persistence" in note for note in snapshot.notes
                     )
@@ -125,7 +129,16 @@ def render_backtest_report(bundles, output):
                     "session": snapshot.session.value,
                     "date": snapshot.session_start.isoformat(),
                     "cutoff": snapshot.as_of.isoformat(),
+                    "joint_effects": joint_effect_rows(snapshot),
                     "evaluated": forecast is not None,
+                    "tyre_strategy": forecast.tyre_strategy_analysis if forecast else None,
+                    "interruptions": forecast.interruption_analysis if forecast else None,
+                    "calibration_role": report.get("probability_calibration", {})
+                    .get("roles", {})
+                    .get(snapshot.event_id + ":" + snapshot.session.value),
+                    "calibration_notice": report.get("probability_calibration", {}).get(
+                        "limitations"
+                    ),
                     "forecast": readable_rows(
                         forecast.standings, names, team_names, actual_positions
                     )
@@ -184,6 +197,28 @@ def render_backtest_report(bundles, output):
         "sessions": len(sessions),
         "evaluated_sessions": sum(s["evaluated"] for s in sessions),
     }
+
+
+def joint_effect_rows(snapshot):
+    teams = {t.id: t for t in snapshot.teams}
+    result = []
+    for driver in snapshot.drivers:
+        team = teams[driver.team_id]
+        estimates = [
+            e.joint_effects.get(snapshot.session.value) if e else None
+            for e in (driver.performance, team.car.performance)
+        ]
+        if not any(estimates):
+            continue
+        result.append(
+            {
+                "driver": driver.name,
+                "team": team.name,
+                "driver_effect": estimates[0].model_dump(mode="json") if estimates[0] else None,
+                "car_effect": estimates[1].model_dump(mode="json") if estimates[1] else None,
+            }
+        )
+    return result
 
 
 def scenario_brief(wet):

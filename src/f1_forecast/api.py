@@ -1,6 +1,7 @@
 """Optional local HTTP API. Run: uvicorn f1_forecast.api:app --host 127.0.0.1."""
 
 import os
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import Field
@@ -17,17 +18,19 @@ class PredictionRequest(Model):
     max_scenarios: int = Field(default=5, ge=1, le=5)
     use_llm: bool = False
     use_ml: bool = True
+    model_policy: Literal["primary", "ensemble"] = "primary"
     plan: ScenarioPlan | None = None
 
 
 def create_app(database: str | None = None, ml_model=None) -> FastAPI:
     application = FastAPI(title="F1 Race Forecasting Engine", version="0.1.0")
 
-    def service(use_llm=False, use_ml=True):
+    def service(use_llm=False, use_ml=True, model_policy="primary"):
         return ForecastService(
             database or os.getenv("F1_DATABASE", "data/forecast.sqlite3"),
             llm=LLM() if use_llm else None,
             ml_model=(ml_model or os.getenv("F1_ML_MODEL")) if use_ml else None,
+            model_policy=model_policy if use_ml else "heuristic",
         )
 
     @application.get("/health")
@@ -37,7 +40,7 @@ def create_app(database: str | None = None, ml_model=None) -> FastAPI:
     @application.post("/predictions", response_model=Forecast)
     def forecast(request: PredictionRequest):
         try:
-            return service(request.use_llm, request.use_ml).predict(
+            return service(request.use_llm, request.use_ml, request.model_policy).predict(
                 request.snapshot,
                 simulations=request.simulations,
                 seed=request.seed,

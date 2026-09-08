@@ -64,6 +64,31 @@ def test_feature_history_drops_future_and_same_weekend_labels(history):
     assert a.shape == (len(snapshot.drivers), len(FEATURE_NAMES))
 
 
+def test_optional_evidence_reaches_loaded_transformer(history, trained, tmp_path):
+    import numpy as np
+
+    from f1_forecast.engine import LearnerState, default_scenarios
+    from f1_forecast.models import CarPerformance, DriverPerformance
+
+    trained.save(tmp_path / "checkpoint")
+    model = NeuralForecaster.load(tmp_path / "checkpoint")
+    snapshot = Snapshot.model_validate(history[-1]["snapshot"])
+    scenario = default_scenarios(snapshot, LearnerState(), 3).scenarios[0]
+    before, _ = model.scenario_parameters(snapshot, scenario)
+    snapshot.drivers[0].performance = DriverPerformance()
+    snapshot.teams[0].car.performance = CarPerformance()
+    missing, _ = model.scenario_parameters(snapshot, scenario)
+    np.testing.assert_array_equal(before, missing)
+    snapshot.drivers[0].performance = DriverPerformance(
+        race_teammate_delta_pct=-1,
+        clean_lap_variability_pct=0.1,
+    )
+    snapshot.teams[0].car.performance = CarPerformance(race_gap_pct=4, braking=0.1)
+    changed, risk = model.scenario_parameters(snapshot, scenario)
+    assert not np.allclose(before, changed)
+    assert np.isfinite(changed).all() and np.isfinite(risk).all()
+
+
 def test_transformer_is_equivariant_to_driver_input_order_and_ignores_padding(history):
     snapshot = Snapshot.model_validate(history[0]["snapshot"])
     x = torch.from_numpy(feature_matrix(snapshot, [], 0.3)).unsqueeze(0)
