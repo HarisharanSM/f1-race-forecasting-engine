@@ -20,12 +20,13 @@ except ImportError as exc:
     ) from exc
 
 from .ml_data import (
-    FEATURE_NAMES,
     Record,
     chronological_split,
     excluded_drivers,
     feature_matrix,
     history_summary,
+    imputed_weather,
+    model_feature_names,
     records_from_json,
 )
 from .models import Scenario, Session, Snapshot, utcnow
@@ -46,6 +47,9 @@ class TrainingConfig:
     seed: int = 42
     optional_mode: str = "legacy"
     calibrate: bool = False
+    quality_features: bool = False
+    recency_half_life_days: float | None = None
+    listwise_weight: float = 0.0
 
     def __post_init__(self):
         if not 1 <= self.epochs <= 2000 or not 1 <= self.patience <= 2000:
@@ -58,6 +62,16 @@ class TrainingConfig:
             raise ValueError("Invalid dropout, learning rate or seed")
         if self.min_train_events < 1 or self.validation_events < 1:
             raise ValueError("Require separate training and validation events")
+        if self.recency_half_life_days is not None and (
+            not np.isfinite(self.recency_half_life_days) or self.recency_half_life_days <= 0
+        ):
+            raise ValueError("Recency half life must be positive and finite")
+        if not np.isfinite(self.listwise_weight) or not 0 <= self.listwise_weight <= 1:
+            raise ValueError("Listwise weight must be between zero and one")
+        if self.quality_features and (self.optional_mode != "legacy" or self.calibrate):
+            raise ValueError(
+                "Quality feature experiment requires legacy adapters without calibration"
+            )
         if self.optional_mode not in {"legacy", "ignore", "learned"}:
             raise ValueError("optional_mode must be legacy, ignore or learned")
 
@@ -67,7 +81,9 @@ class FieldTransformer(nn.Module):
 
     def __init__(self, config: TrainingConfig):
         super().__init__()
-        self.projection = nn.Linear(len(FEATURE_NAMES), config.hidden_size)
+        self.projection = nn.Linear(
+            len(model_feature_names(config.quality_features)), config.hidden_size
+        )
         layer = nn.TransformerEncoderLayer(
             config.hidden_size,
             config.heads,
@@ -101,12 +117,12 @@ class IndependentRanker(nn.Module):
         super().__init__()
         self.output = (
             nn.Sequential(
-                nn.Linear(len(FEATURE_NAMES), config.hidden_size),
+                nn.Linear(len(model_feature_names(config.quality_features)), config.hidden_size),
                 nn.GELU(),
                 nn.Linear(config.hidden_size, 3),
             )
             if nonlinear
-            else nn.Linear(len(FEATURE_NAMES), 3)
+            else nn.Linear(len(model_feature_names(config.quality_features)), 3)
         )
 
     def forward(self, x, padding):
@@ -122,10 +138,14 @@ def make_network(config, kind):
     raise ValueError("Unsupported ranking architecture")
 
 
-def pack(records: list[Record], history: list[dict], optional_mode="legacy"):
+def pack(
+    records: list[Record], history: list[dict], optional_mode="legacy", quality_features=False
+):
     """Actual weather is a training-only condition; forecast inference uses scenarios."""
     size = max(len(r.snapshot.drivers) for r in records)
-    x = torch.zeros((len(records), size, len(FEATURE_NAMES)), dtype=torch.float32)
+    x = torch.zeros(
+        (len(records), size, len(model_feature_names(quality_features))), dtype=torch.float32
+    )
     padding = torch.ones((len(records), size), dtype=torch.bool)
     clean = torch.zeros_like(padding)
     ranks = torch.zeros((len(records), size))
@@ -137,13 +157,20 @@ def pack(records: list[Record], history: list[dict], optional_mode="legacy"):
 
             s = without_performance(s)
         n = len(s.drivers)
+        weather = s.weather if quality_features and imputed_weather(s) else a.actual_weather
+        wet = (
+            s.weather.rain_probability
+            if quality_features and imputed_weather(s)
+            else a.actual_weather.wet_fraction
+        )
         x[index, :n] = torch.from_numpy(
             feature_matrix(
                 s,
                 history,
-                a.actual_weather.wet_fraction,
-                a.actual_weather.air_temperature_c,
-                a.actual_weather.wind_speed_ms,
+                wet,
+                weather.air_temperature_c,
+                weather.wind_speed_ms,
+                quality_features=quality_features,
             )
         )
         padding[index, :n] = False
@@ -155,7 +182,7 @@ def pack(records: list[Record], history: list[dict], optional_mode="legacy"):
     return x, padding, clean, ranks, retired
 
 
-def objective(network, batch):
+def objective(network, batch, *, sample_weights=None, listwise_weight=0.0):
     x, padding, clean, ranks, retired = batch
     pace, dnf_logits = network(x, padding)
     pairs = clean[:, :, None] & clean[:, None, :]
@@ -166,11 +193,35 @@ def objective(network, batch):
     )
     counts = pairs.sum(dim=(1, 2))
     ranking = (pair_losses * pairs).sum(dim=(1, 2)) / counts.clamp_min(1)
-    ranking = ranking[counts > 0].mean() if (counts > 0).any() else pace.sum() * 0
+    weights = (
+        torch.ones_like(counts, dtype=pace.dtype) if sample_weights is None else sample_weights
+    )
+    valid_weights = weights * (counts > 0)
+    if sample_weights is None:
+        ranking = ranking[counts > 0].mean() if (counts > 0).any() else pace.sum() * 0
+    else:
+        ranking = (ranking * valid_weights).sum() / valid_weights.sum().clamp_min(1e-12)
     race = (x[:, :, 8] > 0.5) & ~padding
     dnf = F.binary_cross_entropy_with_logits(dnf_logits, retired, reduction="none")
-    dnf = (dnf * race).sum() / race.sum().clamp_min(1)
-    return ranking + 0.3 * dnf
+    weighted_race = race * weights[:, None]
+    dnf = (
+        (dnf * race).sum() / race.sum().clamp_min(1)
+        if sample_weights is None
+        else (dnf * weighted_race).sum() / weighted_race.sum().clamp_min(1e-12)
+    )
+    listwise = pace.sum() * 0
+    if listwise_weight:
+        losses = []
+        for i in range(len(pace)):
+            order = torch.argsort(ranks[i].masked_fill(~clean[i], float("inf")))
+            ordered = pace[i, order][clean[i, order]]
+            if len(ordered) >= 2:
+                denominators = torch.logcumsumexp(ordered.flip(0), dim=0).flip(0)
+                losses.append((denominators - ordered).mean() * weights[i])
+        if losses:
+            listwise = torch.stack(losses).sum() / valid_weights.sum().clamp_min(1e-12)
+    base_loss = ranking + 0.3 * dnf
+    return base_loss + listwise_weight * listwise if listwise_weight else base_loss
 
 
 class NeuralForecaster:
@@ -205,7 +256,12 @@ class NeuralForecaster:
             from .measurement_features import without_performance
 
             base_snapshot = without_performance(snapshot)
-        matrix = feature_matrix(base_snapshot, self.history, scenario.wet_fraction)
+        matrix = feature_matrix(
+            base_snapshot,
+            self.history,
+            scenario.wet_fraction,
+            quality_features=self.metadata["config"].get("quality_features", False),
+        )
         with torch.inference_mode():
             pace, logits = self.network(
                 torch.from_numpy(matrix).unsqueeze(0),
@@ -248,7 +304,10 @@ class NeuralForecaster:
     def load(cls, directory: str | Path):
         directory = Path(directory)
         metadata = json.loads((directory / "metadata.json").read_text())
-        if metadata["format_version"] != 1 or metadata["feature_names"] != list(FEATURE_NAMES):
+        config = TrainingConfig(**metadata["config"])
+        if metadata["format_version"] != 1 or metadata["feature_names"] != list(
+            model_feature_names(config.quality_features)
+        ):
             raise ValueError("Unsupported ML checkpoint or feature schema")
         for filename, key in (("weights.pt", "weights_sha256"), ("history.json", "history_sha256")):
             if hashlib.sha256((directory / filename).read_bytes()).hexdigest() != metadata[key]:
@@ -293,8 +352,27 @@ def fit_records(
         len(set(r.feedback.finishing_order) - excluded_drivers(r.feedback)) >= 2 for r in train
     ):
         raise ValueError("Training needs incident-free driver pairs for the pace objective")
-    train_batch = pack(train, train_history, config.optional_mode)
-    validation_batch = pack(validation, train_history, config.optional_mode)
+    train_batch = pack(train, train_history, config.optional_mode, config.quality_features)
+    validation_batch = pack(
+        validation, train_history, config.optional_mode, config.quality_features
+    )
+    newest = max(r.snapshot.session_start for r in train)
+    sample_weights = torch.tensor(
+        [
+            2
+            ** (
+                -(newest - r.snapshot.session_start).total_seconds()
+                / 86400
+                / config.recency_half_life_days
+            )
+            if config.recency_half_life_days
+            else 1.0
+            for r in train
+        ],
+        dtype=torch.float32,
+    )
+    if config.recency_half_life_days is None:
+        sample_weights = None
     # This local RNG context makes retraining reproducible without changing the caller's seed.
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(config.seed)
@@ -307,7 +385,14 @@ def fit_records(
         curve = []
         network.eval()
         with torch.inference_mode():
-            initial_loss = float(objective(network, train_batch))
+            initial_loss = float(
+                objective(
+                    network,
+                    train_batch,
+                    sample_weights=sample_weights,
+                    listwise_weight=config.listwise_weight,
+                )
+            )
         for epoch in range(config.epochs):
             network.train()
             order = rng.permutation(len(train))
@@ -316,7 +401,12 @@ def fit_records(
                 indexes = order[start : start + config.batch_size]
                 batch = tuple(t[indexes] for t in train_batch)
                 optimizer.zero_grad()
-                loss = objective(network, batch)
+                loss = objective(
+                    network,
+                    batch,
+                    sample_weights=sample_weights[indexes] if sample_weights is not None else None,
+                    listwise_weight=config.listwise_weight,
+                )
                 if not torch.isfinite(loss):
                     raise ValueError("Nonfinite ML training loss")
                 loss.backward()
@@ -325,7 +415,9 @@ def fit_records(
                 epoch_losses.append(float(loss.detach()))
             network.eval()
             with torch.inference_mode():
-                validation_loss = float(objective(network, validation_batch))
+                validation_loss = float(
+                    objective(network, validation_batch, listwise_weight=config.listwise_weight)
+                )
             curve.append(
                 {
                     "epoch": epoch + 1,
@@ -342,13 +434,20 @@ def fit_records(
                 break
         network.load_state_dict(best_weights)
         with torch.inference_mode():
-            selected_train_loss = float(objective(network, train_batch))
+            selected_train_loss = float(
+                objective(
+                    network,
+                    train_batch,
+                    sample_weights=sample_weights,
+                    listwise_weight=config.listwise_weight,
+                )
+            )
     development = train + validation
     metadata = {
         "format_version": 1,
         "architecture": network_kind,
         "model_id": str(uuid4()),
-        "feature_names": list(FEATURE_NAMES),
+        "feature_names": list(model_feature_names(config.quality_features)),
         "config": asdict(config),
         "created_at": utcnow().isoformat(),
         "trained_through": max(r.feedback.available_at for r in development).isoformat(),

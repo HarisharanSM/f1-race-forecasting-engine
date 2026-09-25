@@ -2,6 +2,10 @@
 
 The forecasting engine now has a locally trained PyTorch Transformer. It replaces heuristic pace scores and retirement risk when a checkpoint is loaded. LLM research and evidence extraction remain available, but neural training does not need an LLM or API credentials.
 
+## Relationship to the planned local analyst
+
+The numerical Transformer described here is separate from the proposed local language model. See the [system architecture](ARCHITECTURE.md) and [local analyst implementation plan](LOCAL_LLM_IMPLEMENTATION_PLAN.md) for the first **4B / 4-bit / 4,096-total-token** experiment, retrieval, reviewed analyst datasets and adapter evaluation. Those capabilities are planned and unbenchmarked. Initial analysis will not alter numerical predictions; any later forecast influence must pass the existing guarded evaluation. Running a quantised LLM on the 8 GB Mac does not establish that its fine-tuning will fit.
+
 ## Train on actual race data
 
 Use the [real-data workflow](REAL_DATA.md) to download 2024–2025 records, evaluate 2025 chronologically, and save `artifacts/real-data/model`. `--test-from-season 2025` keeps 2024 out of reported test metrics while retaining it as development history. Later 2025 folds may train on earlier 2025 weekends.

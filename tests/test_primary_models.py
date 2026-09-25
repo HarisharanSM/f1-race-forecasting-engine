@@ -61,6 +61,7 @@ def test_active_blend_loads_only_weighted_models(bundle):
     root, _ = bundle
     model = PrimaryBundle(root / "grand_prix")
     model.metadata["weights"] = [0.75, 0, 0.25]
+    model.metadata["trials"] = [{"weights": [0.75, 0, 0.25], "gate": {"accepted": True}}]
     target = records_from_json(synthetic_history(7))[-1].snapshot
     result = model.predict(target, ensemble=True, simulations=100)
     assert result.forecast_model == "probability_ensemble"
@@ -84,3 +85,29 @@ def test_manifest_rejects_transformer_minority(tmp_path):
     (tmp_path / "bundle.json").write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="Invalid primary"):
         PrimaryBundle(tmp_path)
+
+
+def test_legacy_ensemble_without_complete_gate_retains_primary(bundle):
+    root, _ = bundle
+    model = PrimaryBundle(root / "grand_prix")
+    model.metadata["version"] = 1
+    model.metadata["weights"] = [0.75, 0, 0.25]
+    target = records_from_json(synthetic_history(7))[-1].snapshot
+    a = model.predict(target, simulations=100)
+    b = model.predict(target, ensemble=True, simulations=100)
+    assert a.standings == b.standings and a.scenarios == b.scenarios
+    assert set(model.models) == {"field_transformer"}
+
+
+def test_primary_reserves_three_windows_and_repeats_training_seeds(tmp_path):
+    torch.set_num_threads(1)
+    rows = synthetic_history(23)
+    result = train_bundle(rows, TrainingConfig(epochs=1, min_train_events=1), tmp_path / "bundle")
+    assert result["version"] == 2
+    assert result["acceptance_policy"]["coverage_mode"] == "nominal"
+    assert result["acceptance_policy"]["pairwise_tolerance"] == 0.002
+    assert result["training_seeds"] == [42, 43, 44]
+    assert len(result["selection_events"]) == 18
+    model = PrimaryBundle(tmp_path / "bundle").model("field_transformer")
+    assert not set(model.metadata["development_events"]) & set(result["selection_events"])
+    assert all(len(t["gate"]["windows"]) == 9 for t in result["trials"])

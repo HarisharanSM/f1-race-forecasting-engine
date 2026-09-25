@@ -72,7 +72,9 @@ def quality_sessions(sessions):
     return result
 
 
-def enrich_snapshot(snapshot, sessions, *, quality_aware=False):
+def enrich_snapshot(snapshot, sessions, *, quality_aware=False, fill_missing=False):
+    if fill_missing and not quality_aware:
+        raise ValueError("Filling partial evidence requires quality-aware measurements")
     if snapshot.synthetic:
         raise ValueError("Real collected measurements cannot enrich synthetic snapshots")
     stage = "race" if snapshot.session == Session.RACE else "qualifying"
@@ -119,8 +121,21 @@ def enrich_snapshot(snapshot, sessions, *, quality_aware=False):
             }
         )
 
+    def merge(existing, cls, values, qualities, available_at):
+        if existing is None:
+            return cls(**values, weight=0.25, available_at=available_at, quality=qualities)
+        # Do not replace any supplied measurement, risk, joint effect or object weight.
+        updated = existing.model_dump()
+        updated.update(values)
+        updated["quality"] = {
+            **updated["quality"],
+            **{k: q.model_dump() for k, q in qualities.items()},
+        }
+        updated["available_at"] = max(existing.available_at or available_at, available_at)
+        return cls.model_validate(updated)
+
     for driver in updated.drivers:
-        if driver.performance is not None:
+        if driver.performance is not None and (not fill_missing or driver.performance.weight == 0):
             continue
         for data in candidates:
             # IDs and team membership must both match; numbers alone are not identities.
@@ -138,6 +153,8 @@ def enrich_snapshot(snapshot, sessions, *, quality_aware=False):
             variability = row["clean_lap_variability_pct"]
             if variability is not None and 0 <= variability <= 20:
                 values["clean_lap_variability_pct"] = variability
+            if driver.performance is not None:
+                values = {k: v for k, v in values.items() if getattr(driver.performance, k) is None}
             if not values:
                 continue
             qualities = {}
@@ -157,11 +174,12 @@ def enrich_snapshot(snapshot, sessions, *, quality_aware=False):
                         qualities[name] = quality(
                             data, [row], name, samples, cohorts=len(row["stints"])
                         )
-            driver.performance = DriverPerformance(
-                **values,
-                weight=0.25,
-                available_at=evidence_availability(data, snapshot),
-                quality=qualities,
+            driver.performance = merge(
+                driver.performance,
+                DriverPerformance,
+                values,
+                qualities,
+                evidence_availability(data, snapshot),
             )
             remember(
                 data,
@@ -172,9 +190,17 @@ def enrich_snapshot(snapshot, sessions, *, quality_aware=False):
                     "variability_laps": sum(s["laps"] for s in row["stints"]),
                 },
             )
-            break
+            if not fill_missing or (
+                getattr(driver.performance, f"{stage}_teammate_delta_pct") is not None
+                and driver.performance.clean_lap_variability_pct is not None
+            ):
+                break
     for team in updated.teams:
-        if team.car.performance is not None:
+        if team.car.performance is not None and (
+            not fill_missing
+            or team.car.performance.weight == 0
+            or getattr(team.car.performance, f"{stage}_gap_pct") is not None
+        ):
             continue
         for data in candidates:
             members = [
@@ -198,11 +224,12 @@ def enrich_snapshot(snapshot, sessions, *, quality_aware=False):
                     max(r["pace_gap_pct_spread_pct"] for r in members),
                     min(r["pace_gap_pct_cohorts"] for r in members),
                 )
-            team.car.performance = CarPerformance(
-                **values,
-                weight=0.25,
-                available_at=evidence_availability(data, snapshot),
-                quality=qualities,
+            team.car.performance = merge(
+                team.car.performance,
+                CarPerformance,
+                values,
+                qualities,
+                evidence_availability(data, snapshot),
             )
             remember(
                 data,

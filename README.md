@@ -109,6 +109,12 @@ f1-forecast fetch-event --season YEAR --round ROUND --session race \
 
 Live weather collection requires a session in the next 15 days. Race inputs use that event's published qualifying results for the roster and order. Qualifying inputs use the previous race's **provisional roster**; check substitutions. For a season opener, supply a confirmed roster yourself. Car, driver and circuit ratings start neutral and require current evidence. Fetching a roster alone does not establish pace. Lap count is supplied explicitly because upcoming schedules may not provide it.
 
+## Planned local specialist analyst
+
+The [implementation plan](docs/LOCAL_LLM_IMPLEMENTATION_PLAN.md) starts with **Qwen3.5-4B, 4-bit weights and a 4,096-token total context** on an M1 MacBook Air with 8 GB RAM. It covers local inference, evidence retrieval, analysis evaluation, reviewed training data, adapter training feasibility and a measured 2B fallback. The [system design and architecture](docs/ARCHITECTURE.md) maps existing components and defines the proposed contracts, storage and release boundaries.
+
+This is a planned extension, not an installed or benchmarked local model. The first release will analyse numerical forecasts without changing them. Proposed commands and configuration in the plan are not supported yet; the existing hosted LLM workflow below retains its current behaviour.
+
 ## LLM research, extraction and prediction
 
 Export the settings documented in `.env.example`; `.env` files are not automatically loaded.

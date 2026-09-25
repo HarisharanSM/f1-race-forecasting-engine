@@ -38,3 +38,7 @@ Select the smallest-index minimum validation position-log-loss candidate among s
 The default source is the verified incident-era 2020-2026 enriched dataset. Source hashes are checked against its saved reports. Output must be new. `comparison.html` contains overall/yearly scores; `comparison.json` includes provenance and 1,000 paired calendar-weekend bootstrap intervals against the Transformer. Format-specific JSON files retain forecasts, selected weights, model metadata, exact fold memberships and skipped weekends. No existing reports or deployed model are replaced.
 
 The historical periods have been repeatedly inspected. Treat this as retrospective development evidence, not a pristine untouched test. 2026 is a saved year-to-date collection through Italian GP qualifying, not a complete season or a newly refreshed dataset. Whole-weekend bootstrap intervals do not model all temporal dependence or prior model-selection bias. The comparison must be frozen and evaluated prospectively before deployment changes.
+
+## Updated selection workflow
+
+The saved results and seven-weight procedure above describe the original experiment. New runs now use the complete acceptance gate from [Guarded improvements](GUARDED_IMPROVEMENTS.md), three chronological selection windows, three training seeds and the conservative primary-bundle candidate weights. Scores and coverage from a new run must not be equated with those archived results.

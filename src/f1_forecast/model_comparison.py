@@ -70,6 +70,10 @@ def blend_forecasts(forecasts, weights):
 
 
 def compare(rows, config, simulations=1000, progress=None):
+    from .acceptance import interval_quality_policy, selection_split
+    from .primary_models import select_weights
+
+    policy = interval_quality_policy()
     records = records_from_json(rows)
     if any(r.feedback.available_at > utcnow() for r in records):
         raise ValueError("Future feedback cannot be evaluated")
@@ -83,9 +87,16 @@ def compare(rows, config, simulations=1000, progress=None):
         cutoff = min(r.snapshot.as_of for r in target)
         earlier = [r for group in groups[:index] for r in group if r.feedback.available_at < cutoff]
         try:
-            development, selection = chronological_split(
-                earlier, config.min_train_events + config.validation_events, 2
-            )
+            try:
+                development, selection = selection_split(
+                    earlier, config.min_train_events + config.validation_events, policy
+                )
+                seeds = [config.seed + index + i for i in range(policy.training_seeds)]
+            except ValueError:
+                development, selection = chronological_split(
+                    earlier, config.min_train_events + config.validation_events, 2
+                )
+                seeds = [config.seed + index]
             train, validation = chronological_split(
                 development, config.min_train_events, config.validation_events
             )
@@ -96,26 +107,25 @@ def compare(rows, config, simulations=1000, progress=None):
         except ValueError as exc:
             skipped.append({"event_id": target[0].snapshot.event_id, "reason": str(exc)})
             continue
-        models = [
-            fit_records(development, replace(config, seed=config.seed + index), network_kind=k)
-            for k in KINDS
-        ]
-        selection_forecasts = [
-            [predict(r.snapshot, ml_model=m, simulations=simulations, seed=42) for m in models]
-            for r in selection
-        ]
-        scores = [
-            float(
-                np.mean(
-                    [
-                        evaluate(blend_forecasts(fs, w), r.feedback)["position_log_loss"]
-                        for fs, r in zip(selection_forecasts, selection, strict=True)
-                    ]
-                )
-            )
-            for w in WEIGHTS
-        ]
-        weights = WEIGHTS[int(np.argmin(scores))]
+        seeded_forecasts, models = {}, None
+        for seed in seeds:
+            fitted = [
+                fit_records(development, replace(config, seed=seed), network_kind=k) for k in KINDS
+            ]
+            if models is None:
+                models = fitted
+            seeded_forecasts[seed] = [
+                [predict(r.snapshot, ml_model=m, simulations=simulations, seed=42) for m in fitted]
+                for r in selection
+            ]
+        weights, trials = select_weights(
+            seeded_forecasts[seeds[0]],
+            [r.feedback for r in selection],
+            records=selection,
+            seeded_forecasts=seeded_forecasts,
+            policy=policy,
+        )
+        scores = [trial["metrics"]["position_log_loss"] for trial in trials]
         fold = {
             "event_id": target[0].snapshot.event_id,
             "prediction_cutoff": cutoff.isoformat(),
@@ -127,6 +137,8 @@ def compare(rows, config, simulations=1000, progress=None):
             ).isoformat(),
             "weights": list(weights),
             "candidate_log_losses": scores,
+            "acceptance_trials": trials,
+            "training_seeds": seeds,
             "models": {k: m.metadata for k, m in zip(KINDS, models, strict=True)},
         }
         for record in target:
@@ -134,7 +146,11 @@ def compare(rows, config, simulations=1000, progress=None):
                 predict(record.snapshot, ml_model=m, simulations=simulations, seed=42)
                 for m in models
             ]
-            ensemble = blend_forecasts(forecasts, weights)
+            ensemble = (
+                forecasts[0].model_copy(deep=True)
+                if weights == [1, 0, 0]
+                else blend_forecasts(forecasts, weights)
+            )
             ensemble.ml_training_cutoff = max(r.feedback.available_at for r in selection)
             forecasts.append(ensemble)
             results.append(

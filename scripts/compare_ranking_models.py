@@ -88,7 +88,7 @@ def run(args):
         "limitations": "Architecture comparison on identical 27 features including the same legacy optional-input adapters. "
         "No architecture receives the specialized learned measurement correction or pace calibration. "
         "Same clean-pair ranking and DNF objective, training budget, simulator and seed. "
-        "Two earlier weekends select epochs; a separate later two-weekend window selects among seven fixed probability blends. "
+        "Earlier weekends select epochs; three subsequent windows with at least six weekends per session and three training seeds gate conservative probability blends. Insufficient evidence retains the exact Transformer. "
         "No selection labels are supplied to component models or their history features. "
         "All models share the same target weekends; extra validation reduces coverage versus previous reports. "
         "This is not a head-to-head with the previously optimized production pipeline. "

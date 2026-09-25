@@ -8,7 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .engine import evaluate, predict
+from .acceptance import acceptance_gate, interval_quality_policy, pair_record, selection_split
+from .engine import predict
 from .ml_data import chronological_split, records_from_json
 from .model_comparison import KINDS, blend_forecasts
 from .models import utcnow
@@ -25,37 +26,44 @@ CANDIDATES = (
 )
 
 
-def select_weights(forecasts, actuals):
-    if not forecasts or not actuals:
-        raise ValueError("Ensemble selection requires earlier forecasts and outcomes")
+def select_weights(forecasts, actuals, *, records=None, seeded_forecasts=None, policy=None):
+    """No candidate is selected without matched records and repeated training seeds."""
+    if not forecasts or not actuals or len(forecasts) != len(actuals):
+        raise ValueError("Ensemble selection requires matched earlier forecasts and outcomes")
+    policy = policy or interval_quality_policy()
+    if records is None or seeded_forecasts is None:
+        return list(CANDIDATES[0]), [
+            {
+                "weights": list(CANDIDATES[0]),
+                "gate": {
+                    "accepted": False,
+                    "reasons": ["Missing chronological multi-seed validation evidence"],
+                },
+            }
+        ]
+    if len(records) != len(actuals) or any(
+        r.feedback != a for r, a in zip(records, actuals, strict=True)
+    ):
+        raise ValueError("Selection records and feedback differ")
     trials = []
     for weights in CANDIDATES:
-        scores = [
-            evaluate(blend_forecasts(fs, weights), a)
-            for fs, a in zip(forecasts, actuals, strict=True)
+        pairs = [
+            pair_record(
+                r, fs[0], fs[0] if weights == CANDIDATES[0] else blend_forecasts(fs, weights), seed
+            )
+            for seed, predictions in seeded_forecasts.items()
+            for r, fs in zip(records, predictions, strict=True)
         ]
+        gate = acceptance_gate(pairs, policy)
         trials.append(
-            {
-                "weights": list(weights),
-                "metrics": {k: float(np.mean([s[k] for s in scores])) for k in scores[0]},
-            }
+            {"weights": list(weights), "metrics": gate["overall"]["candidate"], "gate": gate}
         )
-    base = trials[0]["metrics"]
-    accepted = [
-        r
-        for r in trials[1:]
-        if r["metrics"]["position_log_loss"] < base["position_log_loss"] - 0.001
-        and r["metrics"]["winner_brier"] < base["winner_brier"] - 0.0001
-        and r["metrics"]["expected_position_mae"] <= base["expected_position_mae"]
-        and r["metrics"]["winner_correct"] >= base["winner_correct"]
-    ]
-    chosen = (
-        min(accepted, key=lambda r: r["metrics"]["position_log_loss"]) if accepted else trials[0]
-    )
+    accepted = [r for r in trials[1:] if r["gate"]["accepted"]]
+    chosen = min(accepted, key=lambda r: r["metrics"]["winner_brier"]) if accepted else trials[0]
     return chosen["weights"], trials
 
 
-def train_bundle(rows, config, destination):
+def train_bundle(rows, config, destination, *, policy=None):
     destination = Path(destination)
     if destination.exists():
         raise ValueError("Choose a new bundle directory")
@@ -63,20 +71,41 @@ def train_bundle(rows, config, destination):
     if any(r.feedback.available_at > utcnow() for r in records):
         raise ValueError("Cannot train with future results")
     config = replace(config, optional_mode="legacy", calibrate=False)
-    development, selection = chronological_split(
-        records, config.min_train_events + config.validation_events, 2
+    policy = policy or interval_quality_policy()
+    try:
+        development, selection = selection_split(
+            records, config.min_train_events + config.validation_events, policy
+        )
+        seeds = [config.seed + i for i in range(policy.training_seeds)]
+    except ValueError:
+        # Small histories still produce a usable primary, never a weakly selected blend.
+        development, selection = chronological_split(
+            records, config.min_train_events + config.validation_events, 2
+        )
+        seeds = [config.seed]
+    seeded_forecasts, models = {}, None
+    for seed in seeds:
+        fitted = [
+            fit_records(development, replace(config, seed=seed), network_kind=k) for k in KINDS
+        ]
+        if models is None:
+            models = fitted
+        seeded_forecasts[seed] = [
+            [predict(r.snapshot, ml_model=m, simulations=1000, seed=42) for m in fitted]
+            for r in selection
+        ]
+    weights, trials = select_weights(
+        seeded_forecasts[seeds[0]],
+        [r.feedback for r in selection],
+        records=selection,
+        seeded_forecasts=seeded_forecasts,
+        policy=policy,
     )
-    models = [fit_records(development, config, network_kind=k) for k in KINDS]
-    predictions = [
-        [predict(r.snapshot, ml_model=m, simulations=1000, seed=42) for m in models]
-        for r in selection
-    ]
-    weights, trials = select_weights(predictions, [r.feedback for r in selection])
     destination.mkdir(parents=True)
     for kind, model in zip(KINDS, models, strict=True):
         model.save(destination / kind)
     manifest = {
-        "version": 1,
+        "version": 2,
         "primary": "field_transformer",
         "model_order": list(KINDS),
         "components": {k: m.model_id for k, m in zip(KINDS, models, strict=True)},
@@ -91,9 +120,12 @@ def train_bundle(rows, config, destination):
         ),
         "race_format": records[0].snapshot.race_format,
         "synthetic": records[0].snapshot.synthetic,
-        "rule": "At least 75% Transformer. Improve validation log loss >0.001 and winner Brier >0.0001, "
-        "without worse MAE or winner accuracy; otherwise exact Transformer. Two reserved weekends, "
-        "not used for component fitting or epoch selection. Limited evidence; no future gain guaranteed.",
+        "acceptance_policy": trials[0]["gate"]["policy"],
+        "training_seeds": seeds,
+        "rule": "At least 75% Transformer. Three chronological windows of at least six weekends "
+        "per session and three training seeds. Improve MAE and Brier; protect log loss, pairwise "
+        "and winner accuracy within declared tolerances, nominal 80% coverage, width and interval score. Require paired weekend "
+        "uncertainty checks. Insufficient evidence retains the exact primary. Future gains are not guaranteed.",
     }
     (destination / "bundle.json").write_text(json.dumps(manifest, indent=2))
     return manifest
@@ -106,7 +138,7 @@ class PrimaryBundle:
         meta = self.metadata
         weights = np.asarray(meta["weights"], dtype=float)
         if (
-            meta.get("version") != 1
+            meta.get("version") not in {1, 2}
             or meta.get("primary") != KINDS[0]
             or meta.get("model_order") != list(KINDS)
             or weights.shape != (3,)
@@ -141,7 +173,11 @@ class PrimaryBundle:
             raise ValueError("Primary bundle format or data mode mismatch")
         primary = predict(snapshot, ml_model=self.model(KINDS[0]), **kwargs)
         primary.ml_training_cutoff = datetime.fromisoformat(meta["selected_through"])
-        if not ensemble or meta["weights"] == [1, 0, 0]:
+        approved = meta.get("version") == 2 and any(
+            trial.get("weights") == meta["weights"] and trial.get("gate", {}).get("accepted")
+            for trial in meta.get("trials", [])
+        )
+        if not ensemble or meta["weights"] == [1, 0, 0] or not approved:
             if ensemble:
                 primary.warnings.append(
                     "Ensemble validation gate retained the primary Transformer unchanged."

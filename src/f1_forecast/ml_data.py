@@ -32,6 +32,70 @@ FEATURE_NAMES = (
     "history_age",
 )
 
+QUALITY_FEATURE_NAMES = (
+    "reduced_inputs",
+    "weather_imputed",
+    "qualifying_order_missing",
+    "driver_pace_missing",
+    "car_pace_missing",
+    "measurement_quality_known",
+    "measurement_usable_fraction",
+    "measurement_age",
+)
+
+
+def model_feature_names(quality_features=False):
+    return FEATURE_NAMES + (QUALITY_FEATURE_NAMES if quality_features else ())
+
+
+def imputed_weather(snapshot):
+    return (
+        any(n.startswith("REDUCED INPUT:") for n in snapshot.notes)
+        or "imput" in snapshot.weather.source.lower()
+    )
+
+
+def quality_matrix(snapshot):
+    """Use only explicit pre-cutoff evidence; absence is separate from a zero value."""
+    teams = {t.id: t for t in snapshot.teams}
+    stage = snapshot.session.value
+    rows = []
+    for driver in snapshot.drivers:
+        own, car = driver.performance, teams[driver.team_id].car.performance
+        qualities = [
+            q for e in (own, car) if e is not None and e.weight > 0 for q in e.quality.values()
+        ]
+        if any(q.observed_at > snapshot.as_of for q in qualities):
+            raise ValueError("Measurement quality is newer than forecast cutoff")
+        rows.append(
+            [
+                float(any(n.startswith("REDUCED INPUT:") for n in snapshot.notes)),
+                float(imputed_weather(snapshot)),
+                float(snapshot.session == Session.RACE and not snapshot.qualifying_order),
+                float(
+                    own is None
+                    or own.weight == 0
+                    or getattr(own, f"{stage}_teammate_delta_pct", None) is None
+                ),
+                float(
+                    car is None or car.weight == 0 or getattr(car, f"{stage}_gap_pct", None) is None
+                ),
+                float(bool(qualities)),
+                float(np.mean([q.usable_fraction for q in qualities])) if qualities else 0,
+                float(
+                    np.mean(
+                        [
+                            min(1, (snapshot.as_of - q.observed_at).total_seconds() / (30 * 86400))
+                            for q in qualities
+                        ]
+                    )
+                )
+                if qualities
+                else 1,
+            ]
+        )
+    return np.asarray(rows, dtype=np.float32)
+
 
 @dataclass
 class Record:
@@ -104,6 +168,8 @@ def feature_matrix(
     wet: float,
     temperature: float | None = None,
     wind: float | None = None,
+    *,
+    quality_features: bool = False,
 ) -> np.ndarray:
     """No driver-position encoding: reordering input drivers only reorders feature rows."""
     temperature = snapshot.weather.air_temperature_c if temperature is None else temperature
@@ -158,7 +224,10 @@ def feature_matrix(
             min(1, (snapshot.as_of - latest).total_seconds() / 86400 / 365) if latest else 1,
         ]
         rows.append([*base[i], *context])
-    return np.asarray(rows, dtype=np.float32)
+    matrix = np.asarray(rows, dtype=np.float32)
+    return (
+        np.concatenate([matrix, quality_matrix(snapshot)], axis=1) if quality_features else matrix
+    )
 
 
 def event_groups(records: list[Record]) -> list[list[Record]]:
